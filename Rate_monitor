@@ -1,0 +1,114 @@
+import requests
+from bs4 import BeautifulSoup
+import time
+import logging
+from datetime import datetime
+
+# --- 核心配置区 ---
+PUSHPLUS_TOKEN = '******' 
+CURRENCY_NAME = "英镑"
+
+# 阶梯告警设置
+LEVEL1_RATE = 9.25       # 【初步预期】告警线
+LEVEL2_RATE = 9.20       # 【⭐五星区】告警线（连续3条）
+
+CHECK_INTERVAL = 600     # 检查频率，10分钟
+# ----------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("fx_monitor.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+
+def get_boc_rate():
+    url = "https://www.bankofchina.com/sourcedb/whpj/"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.encoding = 'utf-8'
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        tables = soup.find_all('table')
+        for t in tables:
+            if CURRENCY_NAME in t.text:
+                for row in t.find_all('tr'):
+                    cols = row.find_all('td')
+                    if len(cols) >= 4 and cols[0].text.strip() == CURRENCY_NAME:
+                        return round(float(cols[3].text.strip()) / 100, 4)
+    except Exception as e:
+        logging.error(f"抓取异常: {e}")
+    return None
+
+def send_wechat(rate, level_name):
+    """通过Pushplus推送消息"""
+    url = 'http://www.pushplus.plus/send'
+    # 在标题加入级别名称
+    title = f"{level_name} | {CURRENCY_NAME}: {rate}"
+    
+    content = (
+        f"提示：汇率已进入 <b>{level_name}</b><br>"
+        f"--------------------------<br>"
+        f"当前价格：<span style='color:red; font-size:20px;'><b>{rate}</b></span><br>"
+        f"初步预期线：{LEVEL1_RATE}<br>"
+        f"五星探底线：{LEVEL2_RATE}<br>"
+        f"统计时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    
+    data = {
+        "token": PUSHPLUS_TOKEN,
+        "title": title,
+        "content": content,
+        "template": "html"
+    }
+    
+    try:
+        r = requests.post(url, json=data, timeout=10)
+        logging.info(f"推送已发出: {level_name} (当前价:{rate})")
+    except Exception as e:
+        logging.error(f"推送失败: {e}")
+
+def run_monitor():
+    logging.info(f" 汇率监控启动。期待进入：{LEVEL1_RATE} / {LEVEL2_RATE}")
+    
+    last_alerted_rate = None 
+    
+    while True:
+        rate = get_boc_rate()
+        
+        if rate:
+            logging.info(f"当前查询价格: {rate} (上次告警价格: {last_alerted_rate})")
+            
+            if rate != last_alerted_rate:
+                # 1. 触发五星区条件
+                if rate <= LEVEL2_RATE:
+                    tag = "⭐五星区"
+                    logging.warning(f"进入 {tag}！")
+                    for i in range(3):
+                        send_wechat(rate, tag)
+                        if i < 2: time.sleep(5)
+                    last_alerted_rate = rate 
+                
+                # 2. 触发初步预期条件
+                elif rate <= LEVEL1_RATE:
+                    tag = "初步预期"
+                    logging.warning(f"进入 {tag}！")
+                    send_wechat(rate, tag)
+                    last_alerted_rate = rate 
+                
+                # 3. 价格回到告警线以上
+                else:
+                    if last_alerted_rate is not None:
+                        logging.info("价格已回升至预期上方，重置监控记忆")
+                    last_alerted_rate = None 
+            else:
+                logging.info("价格未发生变动，跳过推送")
+        else:
+            logging.warning("数据抓取失败，跳过")
+        
+        time.sleep(CHECK_INTERVAL)
+
+if __name__ == "__main__":
+    run_monitor()
